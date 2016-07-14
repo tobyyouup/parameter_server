@@ -1,0 +1,335 @@
+#include "data/text_parser.h"
+#include <functional>
+#include "util/strtonum.h"
+#include "util/murmurhash3.h"
+
+namespace PS {
+
+// TODO better name,
+DEFINE_bool(shuffle_fea_id, false,
+  "shuffle fea id of Terafea (lowest 54bits) with MurmurHash3 "
+  "on downloading");
+
+// NOTICE: Do not use strtok, it is not thread-safe, use strtok_r instead
+void ExampleParser::Init(TextFormat format, bool ignore_fea_slot) {
+  ignore_fea_slot_ = ignore_fea_slot;
+  using namespace std::placeholders;
+  switch (format) {
+    case DataConfig::LIBSVM:
+      parser_ = std::bind(&ExampleParser::ParseLibsvm, this, _1, _2);
+      break;
+    case DataConfig::ADFEA:
+      parser_ = std::bind(&ExampleParser::ParseAdfea, this, _1, _2);
+      break;
+    case DataConfig::TERAFEA:
+      parser_ = std::bind(&ExampleParser::ParseTerafea, this, _1, _2);
+      break;
+    case DataConfig::CRITEO:
+      parser_ = std::bind(&ExampleParser::ParseCriteo, this, _1, _2);
+      break;
+    case DataConfig::DENSE:
+    case DataConfig::SPARSE:
+    case DataConfig::SPARSE_BINARY:
+      parser_ = std::bind(&ExampleParser::ParsePS, this, _1, _2, format);
+      break;
+    default:
+      CHECK(false) << "unknown text format " << format;
+  }
+}
+
+bool ExampleParser::ToProto(char* line, Example* ex) {
+  ex->Clear();
+  return parser_(line, ex);
+}
+
+
+// libsvm:
+//
+//   label feature_id:weight feature_id:weight feature_id:weight ...
+//
+// assume feature_ids are ordered
+bool ExampleParser::ParseLibsvm(char* buff, Example* ex) {
+  char *saveptr;
+  // label
+  char * pch = strtok_r(buff, " \t\r\n", &saveptr);
+  float label;
+  char *saveptr_lbl;
+  pch = strtok_r(pch, ":", &saveptr_lbl);
+  if (!strtofloat(pch, &label)) return false;
+  auto lbl_slot = ex->add_slot();
+  lbl_slot->set_id(0);
+  
+  //fix an importance bug, the label shuold be 1 or -1
+  //lbl_slot->add_val(label);
+  lbl_slot->add_val(label > 0 ? 1.0 : -1.0);
+  pch = strtok_r(NULL, ":", &saveptr_lbl);
+  if (pch != NULL) {
+    float sample_weight;
+    if (!strtofloat(pch, &sample_weight)) return false;
+    lbl_slot->add_val(sample_weight);
+  }
+
+  // feature and weights
+  pch = strtok_r(NULL, " \t\r\n", &saveptr);
+  auto fea_slot = ex->add_slot();
+  fea_slot->set_id(1);
+  uint64 idx = 0, last_idx=0;
+  while (pch != NULL) {
+    char *it;
+    for (it = pch; *it != ':' && *it != 0; it ++);
+    if (*it == 0) return false;
+    *it = 0;
+
+    if (!strtou64(pch, &idx)) return false;
+    float val;
+    if (!strtofloat(it+1, &val)) return false;
+    if (last_idx > idx) return false;
+    last_idx = idx;
+
+    fea_slot->add_key(idx);
+    fea_slot->add_val(val);
+    pch = strtok_r(NULL, " \t\r\n", &saveptr);
+  }
+  return true;
+}
+
+// adfea format:
+//
+//   line_id 1 clicked_or_not key:grp_id key:grp_id ...
+//
+// same group_ids should appear together, but not necesary be ordered
+bool ExampleParser::ParseAdfea(char* line, Example* ex) {
+  uint64 key = -1;
+  int pre_slot_id = 0;
+  Slot* slot = ex->add_slot();
+  slot->set_id(0);
+
+  char* saveptr;
+  char* tk = strtok_r(line, " :", &saveptr);
+  for (int i = 0; tk != NULL; tk = strtok_r(NULL, " :", &saveptr), ++i) {
+    if (i == 0) {
+      // skip the line id
+    } else if (i == 1) {
+      // skip, it is always 1
+    } else if (i == 2) {
+      int32 label;
+      if (!strtoi32(tk, &label)) return false;
+      slot->add_val(label > 0 ? 1.0 : -1.0);
+    } else if (i % 2 == 1) {
+      if (!strtou64(tk, &key)) return false;
+    } else {
+      int slot_id = 1;
+      if (!ignore_fea_slot_ && !strtoi32(tk, &slot_id)) return false;
+      if (slot_id != pre_slot_id) {
+        slot = ex->add_slot();
+        slot->set_id(slot_id);
+        pre_slot_id = slot_id;
+      }
+      slot->add_key(key);
+    }
+  }
+  return true;
+}
+
+// terafea format:
+//
+//   clicked_or_not line_id | uint64 uint64 ...
+//   uint64:
+//      the most significant 10 bits    - group id
+//      lower 54 bits                   - feature id
+//
+//  no guarantee that the same group ids stay contiguously
+//
+bool ExampleParser::ParseTerafea(char* line, Example* ex) {
+  // key:   group id
+  // value: index in Example::slot[]
+  std::unordered_map<uint32, uint32> gid_idx_map;
+
+  // add the very first slot
+  Slot* slot = ex->add_slot();
+  slot->set_id(0);
+  gid_idx_map[0] = 0;
+
+  char* saveptr;
+  char* tk = strtok_r(line, " ", &saveptr);
+  for (int i = 0; tk != NULL; tk = strtok_r(NULL, " ", &saveptr), ++i) {
+    if (i == 0) {
+      // label
+      int32 label;
+      if (!strtoi32(tk, &label)) return false;
+      slot->add_val(label > 0 ? 1.0 : -1.0);
+    } else if (i == 1) {
+      // skip, line_id
+    } else if (i == 2) {
+      // skip, seperator
+    } else {
+      uint64 key = -1;
+      if (!strtou64(tk, &key)) return false;
+
+      uint64 grp_id = ignore_fea_slot_ ? 1 : key >> 54;
+      // use the whole as the id to reduce the key conflict probability
+      uint64 fea_id = key;
+      // uint64 fea_id = key & 0x3FFFFFFFFFFFFF;
+
+      if (FLAGS_shuffle_fea_id) {
+        uint64 murmur_out[2];
+        MurmurHash3_x64_128(&fea_id, 8, 512927377, murmur_out);
+        fea_id = (murmur_out[0] ^ murmur_out[1]);
+      }
+
+      auto iter = gid_idx_map.find(grp_id);
+      if (gid_idx_map.end() != iter) {
+        slot = ex->mutable_slot(iter->second);
+      } else {
+        // register in the map
+        gid_idx_map[grp_id] = ex->slot_size();
+        // add new slot in Example
+        slot = ex->add_slot();
+        slot->set_id(grp_id);
+      }
+      slot->add_key(fea_id);
+    }
+  }
+  // LL << ex->ShortDebugString();
+  return true;
+}
+
+
+// ps format:
+//
+// label; group_id feature[:weight] feature[:weight] ...; groud_id ...; ...
+//
+// - label: the label of the extance. integer for classification, float for
+//   regression, and emtpy for unsupervised learning
+//
+// - group_id: the integer identity of a feature group, each extance should
+//   contaex at least one feature group.
+//
+// - feature: an 64-bit integer presenting the feature id for sparse training
+//   data, an float feature value for dense training data.
+//
+// - weight: only valid for non-bianry sparse training data, a float number
+//   presenting the feature value.
+
+bool ExampleParser::ParsePS(char* line, Example* ex, TextFormat format) {
+  char* saveptr;
+  char* tk = strtok_r(line, ";", &saveptr);
+
+  // label
+  int32 label = 0;
+  if (!strtoi32(tk, &label)) return false;
+  Slot* slot = ex->add_slot();
+  slot->set_id(0);
+  slot->add_val(label > 0 ? 1.0 : -1.0);
+
+  // slot
+  int32 slot_id = -1;
+  while (true) {
+    tk = strtok_r(NULL, ";", &saveptr);
+    if (tk == NULL) break;
+
+    // slot id
+    char* saveptr2;
+    char* tk2 = strtok_r(tk, " ", &saveptr2);
+
+    if (!ignore_fea_slot_ || (ignore_fea_slot_ && slot_id == -1)) {
+      if (ignore_fea_slot_) {
+        slot_id = 1;
+      } else {
+        if (!strtoi32(tk2, &slot_id)) return false;
+      }
+      slot = ex->add_slot();
+      slot->set_id(slot_id);
+    }
+
+    // slot feature
+    for (int i = 0; ; ++i) {
+      tk2 = strtok_r(NULL, " :", &saveptr2);
+      if (tk2 == NULL) break;
+
+      if (format == DataConfig::DENSE
+          || (format == DataConfig::SPARSE && i % 2 == 1)) {
+        float val = 0;
+        if (!strtofloat(tk2, &val)) return false;
+        slot->add_val(val);
+      } else {
+        uint64 key = -1;
+        if (!strtou64(tk2, &key)) return false;
+        slot->add_key(key);
+      }
+    }
+  }
+  // LL << ex->ShortDebugString();
+  return true;
+}
+
+// criteo ctr dataset:
+// The columns are tab separeted with the following schema:
+// <label> <integer feature 1> ... <integer feature 13> <categorical feature 1> ... <categorical feature 26>
+bool ExampleParser::ParseCriteo(char* buff,  Example* ex) {
+  // copy from tianqi's codes
+  char* p = buff;
+  char* pp = strchr(buff, '\t');
+  if (pp == NULL) return false;
+  *pp = '\0';
+  float label;
+  if (!strtofloat(p, &label)) return false;
+
+  auto slot = ex->add_slot();
+  slot->set_id(0);
+
+  slot->add_val(label > 0 ? 1.0 : -1.0);
+  p = pp + 1;
+
+  // slot = ex->add_slot();
+  // slot->set_id(1);
+
+  for (int i = 0; i < 13; ++i) {
+    int cnt = 0;
+    pp = strchr(p, '\t');
+    if (pp == NULL) {
+      return false;
+    }
+    *pp = '\0';
+
+    if (strtoi32(p, &cnt)) {
+      if (i == 0 || !ignore_fea_slot_) {
+        slot = ex->add_slot();
+        slot->set_id(i+1);
+      }
+      uint64 key = kMaxKey / 13 * i + cnt;
+      slot->add_key(key);
+    }
+    p = pp + 1;
+  }
+
+  uint64 murmur_out[2];
+  for (int i = 0; i < 26; ++i) {
+    pp = strchr(p, '\t');
+    if (pp == NULL) {
+      if (i != 25) return false;
+    } else {
+      *pp = '\0';
+    }
+
+    int n = strlen(p);
+    if (n > 4) {
+      if (!ignore_fea_slot_) {
+        slot = ex->add_slot();
+        slot->set_id(i+14);
+      }
+      MurmurHash3_x64_128(p, n, 512927377, murmur_out);
+      uint64 key = (murmur_out[0] ^ murmur_out[1]);
+      slot->add_key(key);
+    }
+    p = pp + 1;
+  }
+
+  // LL << ex->slot_size();
+  // LL << ex->ShortDebugString();
+  // LL << slot->key_size();
+  return true;
+}
+// vw: TODO
+//
+}
